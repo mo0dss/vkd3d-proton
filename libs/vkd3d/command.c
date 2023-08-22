@@ -8411,6 +8411,112 @@ VkImageLayout vk_image_layout_from_d3d12_resource_state(
     }
 }
 
+static VkImageLayout vk_image_layout_from_d3d12_barrier(
+        struct d3d12_command_list *list, struct d3d12_resource *resource, D3D12_BARRIER_LAYOUT layout)
+{
+    if (layout == D3D12_BARRIER_LAYOUT_UNDEFINED)
+        return VK_IMAGE_LAYOUT_UNDEFINED;
+
+    /* Simultaneous access is always general, until we're forced to treat it differently in
+     * a transfer, render pass, or similar. */
+    if (resource->flags & (VKD3D_RESOURCE_LINEAR_STAGING_COPY | VKD3D_RESOURCE_SIMULTANEOUS_ACCESS))
+        return VK_IMAGE_LAYOUT_GENERAL;
+
+    switch (layout)
+    {
+        case D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS:
+            return VK_IMAGE_LAYOUT_GENERAL;
+
+        case D3D12_BARRIER_LAYOUT_RENDER_TARGET:
+            return VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+        case D3D12_BARRIER_LAYOUT_SHADING_RATE_SOURCE:
+            return VK_IMAGE_LAYOUT_FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR;
+
+        case D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_READ:
+        case D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_WRITE:
+            /* DEPTH_READ only is not a shader read state, and we treat WRITE and READ more or less the same. */
+            if (list)
+                return d3d12_command_list_get_depth_stencil_resource_layout(list, resource, NULL);
+            else
+                return resource->common_layout;
+
+        default:
+            return resource->common_layout;
+    }
+}
+
+static void vk_image_memory_barrier_subresources_from_d3d12_texture_barrier(
+        struct d3d12_command_list *list, const struct d3d12_resource *resource,
+        const D3D12_BARRIER_SUBRESOURCE_RANGE *range, uint32_t dsv_decay_mask,
+        VkImageSubresourceRange *vk_range)
+{
+    VkImageSubresource subresource;
+    unsigned int i;
+
+    if (range->NumMipLevels == 0)
+    {
+        /* SubresourceIndex path. */
+        if (range->IndexOrFirstMipLevel == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES)
+        {
+            vk_range->aspectMask = resource->format->vk_aspect_mask;
+            vk_range->baseMipLevel = 0;
+            vk_range->baseArrayLayer = 0;
+            vk_range->levelCount = VK_REMAINING_MIP_LEVELS;
+            vk_range->layerCount = VK_REMAINING_ARRAY_LAYERS;
+        }
+        else
+        {
+            subresource = d3d12_resource_get_vk_subresource(resource, range->IndexOrFirstMipLevel, false);
+            vk_range->aspectMask = subresource.aspectMask;
+            vk_range->baseMipLevel = subresource.mipLevel;
+            vk_range->baseArrayLayer = subresource.arrayLayer;
+            vk_range->levelCount = 1;
+            vk_range->layerCount = 1;
+        }
+    }
+    else
+    {
+        vk_range->baseMipLevel = range->IndexOrFirstMipLevel;
+        vk_range->levelCount = range->NumMipLevels;
+        vk_range->baseArrayLayer = range->FirstArraySlice;
+        /* Oddly enough, 0 slices translates to 1 ... */
+        vk_range->layerCount = max(1u, range->NumArraySlices);
+
+        vk_range->aspectMask = 0;
+        for (i = 0; i < range->NumPlanes; i++)
+            vk_range->aspectMask |= vk_image_aspect_flags_from_d3d12(resource->format, i + range->FirstPlane);
+
+        /* This is invalid in D3D12 and trips validation layers. */
+        if (range->NumMipLevels == UINT32_MAX)
+            WARN("Invalid UINT32_MAX miplevels.\n");
+        if (range->NumArraySlices == UINT32_MAX)
+            WARN("Invalid UINT32_MAX array slices.\n");
+    }
+
+    /* In a decay, need to transition everything that we promoted back to the common state.
+     * DSV decay is all or nothing, so just use a full transition. */
+    if ((dsv_decay_mask & VKD3D_DEPTH_PLANE_OPTIMAL) &&
+            (resource->format->vk_aspect_mask & VK_IMAGE_ASPECT_DEPTH_BIT))
+    {
+        vk_range->aspectMask |= VK_IMAGE_ASPECT_DEPTH_BIT;
+        vk_range->baseMipLevel = 0;
+        vk_range->baseArrayLayer = 0;
+        vk_range->levelCount = VK_REMAINING_MIP_LEVELS;
+        vk_range->layerCount = VK_REMAINING_ARRAY_LAYERS;
+    }
+
+    if ((dsv_decay_mask & VKD3D_STENCIL_PLANE_OPTIMAL) &&
+            (resource->format->vk_aspect_mask & VK_IMAGE_ASPECT_STENCIL_BIT))
+    {
+        vk_range->aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
+        vk_range->baseMipLevel = 0;
+        vk_range->baseArrayLayer = 0;
+        vk_range->levelCount = VK_REMAINING_MIP_LEVELS;
+        vk_range->layerCount = VK_REMAINING_ARRAY_LAYERS;
+    }
+}
+
 static void vk_image_memory_barrier_for_transition(
         VkImageMemoryBarrier2 *image_barrier, const struct d3d12_resource *resource,
         UINT subresource_idx, VkImageLayout old_layout, VkImageLayout new_layout,
@@ -8492,7 +8598,7 @@ static void d3d12_command_list_barrier_batch_end(struct d3d12_command_list *list
     dep_info.imageMemoryBarrierCount = batch->image_barrier_count;
     dep_info.pImageMemoryBarriers = batch->vk_image_barriers;
 
-    if (batch->vk_memory_barrier.srcStageMask && batch->vk_memory_barrier.dstStageMask)
+    if (batch->vk_memory_barrier.srcStageMask || batch->vk_memory_barrier.dstStageMask)
     {
         dep_info.memoryBarrierCount = 1;
         dep_info.pMemoryBarriers = &batch->vk_memory_barrier;
@@ -9749,6 +9855,16 @@ static bool vkd3d_rtv_and_aspects_fully_cover_resource(const struct d3d12_resour
             resource->desc.MipLevels == 1 &&
             view->info.texture.layer_idx == 0 &&
             view->info.texture.layer_count >= resource->desc.DepthOrArraySize; /* takes care of REMAINING_LAYERS as well. */
+}
+
+static bool vkd3d_subresource_range_covers_resource(const struct d3d12_resource *resource,
+        const VkImageSubresourceRange *vk_range)
+{
+    return vk_range->aspectMask == resource->format->vk_aspect_mask &&
+            vk_range->baseMipLevel == 0 &&
+            vk_range->baseArrayLayer == 0 &&
+            vk_range->levelCount >= resource->desc.MipLevels &&
+            vk_range->layerCount >= d3d12_resource_desc_get_layer_count(&resource->desc);
 }
 
 static void d3d12_command_list_clear_attachment(struct d3d12_command_list *list, struct d3d12_resource *resource,
@@ -12988,6 +13104,16 @@ static VkPipelineStageFlags2 vk_stage_flags_from_d3d12_barrier(struct d3d12_comm
     if (sync & D3D12_BARRIER_SYNC_ALL)
         return VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
 
+    /* Split barriers are currently broken in the D3D12 runtime, so they cannot be used,
+     * but the spec for them is rather unfortunate, you're meant to synchronize once with
+     * SyncAfter = SPLIT, and then SyncBefore = SPLIT to complete the barrier.
+     * Apparently, there can only be one SPLIT barrier in flight for each (sub-)resource
+     * which is extremely weird and suggests we have to track a VkEvent to make this work,
+     * which is complete bogus. SPLIT barriers are allowed cross submissions even ...
+     * Only reasonable solution is to force ALL_COMMANDS_BIT when SPLIT is observed. */
+    if (sync == D3D12_BARRIER_SYNC_SPLIT)
+        return VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+
     if (sync & D3D12_BARRIER_SYNC_DRAW)
     {
         sync |= D3D12_BARRIER_SYNC_INDEX_INPUT |
@@ -13192,7 +13318,91 @@ static void d3d12_command_list_process_enhanced_barrier_buffer(struct d3d12_comm
 static void d3d12_command_list_process_enhanced_barrier_texture(struct d3d12_command_list *list,
         struct d3d12_command_list_barrier_batch *batch, const D3D12_TEXTURE_BARRIER *barrier)
 {
-    FIXME("TODO!\n");
+    VkImageMemoryBarrier2 vk_transition;
+    struct d3d12_resource *resource;
+    uint32_t dsv_decay_mask = 0;
+    bool discarding_transition;
+
+    if (barrier->SyncBefore == D3D12_BARRIER_SYNC_SPLIT || barrier->SyncAfter == D3D12_BARRIER_SYNC_SPLIT)
+        WARN("Split barriers are known to be broken on D3D12 native runtime.\n");
+
+    if (!barrier->pResource)
+    {
+        WARN("No pResource.\n");
+        return;
+    }
+
+    resource = impl_from_ID3D12Resource(barrier->pResource);
+    if (!resource || !d3d12_resource_is_texture(resource))
+    {
+        WARN("Resource is not a texture.\n");
+        return;
+    }
+
+    /* Split barrier. Defer this until SyncBefore = SPLIT. See notes in sync flag translation. */
+    if (barrier->SyncAfter == D3D12_BARRIER_SYNC_SPLIT)
+        return;
+
+    /* This is a no-op, but zero array planes is not a noop for some bizarre reason. */
+    if (barrier->Subresources.NumMipLevels != 0 && barrier->Subresources.NumPlanes == 0)
+    {
+        WARN("No-op texture barrier due to NumPlanes == 0.\n");
+        return;
+    }
+
+    if (barrier->Subresources.NumMipLevels != 0 && barrier->Subresources.NumArraySlices == 0)
+        WARN("NumArraySlices == 0 promotes to 1 slice.\n");
+
+    if (list->tracked_copy_buffer_count && (
+            d3d12_barrier_accesses_copy_dest(barrier->SyncBefore, barrier->AccessBefore) ||
+            d3d12_barrier_accesses_copy_dest(barrier->SyncAfter, barrier->AccessAfter)))
+    {
+        d3d12_command_list_reset_buffer_copy_tracking(list);
+        batch->vk_memory_barrier.srcStageMask |= VK_PIPELINE_STAGE_2_COPY_BIT;
+        batch->vk_memory_barrier.srcAccessMask |= VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        batch->vk_memory_barrier.dstStageMask |= VK_PIPELINE_STAGE_2_COPY_BIT;
+        batch->vk_memory_barrier.dstAccessMask |= VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    }
+
+    if (resource->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
+        dsv_decay_mask = d3d12_command_list_notify_dsv_state_enhanced(list, resource, barrier);
+
+    vk_transition.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    vk_transition.pNext = NULL;
+    vk_transition.oldLayout = vk_image_layout_from_d3d12_barrier(list, resource, barrier->LayoutBefore);
+    vk_transition.newLayout = vk_image_layout_from_d3d12_barrier(list, resource, barrier->LayoutAfter);
+    vk_transition.srcStageMask = vk_stage_flags_from_d3d12_barrier(list, barrier->SyncBefore, barrier->AccessBefore);
+    vk_transition.dstStageMask = vk_stage_flags_from_d3d12_barrier(list, barrier->SyncAfter, barrier->AccessAfter);
+    vk_transition.srcAccessMask = vk_access_flags_from_d3d12_barrier(barrier->AccessBefore);
+    vk_transition.dstAccessMask = vk_access_flags_from_d3d12_barrier(barrier->AccessAfter);
+    vk_transition.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    vk_transition.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+
+    /* This works like a "deactivating" discard.
+     * The behavior around UNDEFINED layout in D3D12 is ... not well explained in the docs.
+     * The basic idea for aliasing seems to be that you should transition to UNDEFINED + NO_ACCESS to "deactivate",
+     * and the activating resource will transition from UNDEFINED.
+     * Using NO_ACCESS seems to imply that the resource can be invalidated, so any subsequent transition
+     * from UNDEFINED should be able to discard, regardless of the DISCARD flag.
+     * For deactivation, we will perform no layout transition. In sync2, this is done by setting newLayout == oldLayout. */
+    if (vk_transition.newLayout == VK_IMAGE_LAYOUT_UNDEFINED)
+        vk_transition.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    if (barrier->LayoutBefore == D3D12_BARRIER_LAYOUT_UNDEFINED && !(barrier->Flags & D3D12_TEXTURE_BARRIER_FLAG_DISCARD))
+        FIXME("Transitioning away from UNDEFINED, but there is no DISCARD flag. Uncertain what is expected here. vkd3d-proton will force a discard.");
+
+    vk_image_memory_barrier_subresources_from_d3d12_texture_barrier(list, resource,
+            &barrier->Subresources, dsv_decay_mask, &vk_transition.subresourceRange);
+
+    d3d12_command_list_barrier_batch_add_layout_transition(list, batch, &vk_transition);
+    discarding_transition = vk_transition.oldLayout == VK_IMAGE_LAYOUT_UNDEFINED &&
+            vk_transition.newLayout != VK_IMAGE_LAYOUT_UNDEFINED &&
+            vkd3d_subresource_range_covers_resource(resource, &vk_transition.subresourceRange);
+
+    d3d12_command_list_track_resource_usage(list, resource, !discarding_transition);
+
+    /* TODO: Linear image feedback */
+    /* TODO: DSV state tracking */
 }
 
 static void STDMETHODCALLTYPE d3d12_command_list_Barrier(d3d12_command_list_iface *iface, UINT32 NumBarrierGroups, const D3D12_BARRIER_GROUP *pBarrierGroups)
